@@ -11,6 +11,7 @@ Streaming Python parser for 1C technological journal files. It reads files recor
 - Prints file name, byte offset, time, event type, `Rows`, full `Context`, SQL, execution plan, `Planning Time`, `Execution Time`, `Buffers`, and `RowsAffected`.
 - Saves every matched record into a separate file.
 - Can print only the last N matched records.
+- Writes progress logs to stderr while scanning large files, including file count, record count, matches, bytes read, speed, current file, and offset.
 
 ## Usage
 
@@ -37,6 +38,7 @@ Useful options:
 --output FILE          write formatted search results to this file instead of stdout
 --glob MASK            file mask when scanning directories; default is *.log
 --encoding ENCODING    input encoding; default is utf-8
+--progress-interval N  seconds between progress messages; 0 disables logs
 ```
 
 ## Verify the script version
@@ -47,3 +49,11 @@ If `--object` or `--output` is reported as an unrecognized argument, you are run
 python3 techlog_parser.py --help | grep -E -- '--object|--output'
 python3 techlog_parser.py --version
 ```
+
+
+## Performance tips
+
+- Use `--since 60m` or another time window to skip old files by modification time.
+- Use `--event DBPOSTGRS,SDBL` to discard other event types before expensive field parsing.
+- Use `--object` or `--text` when possible; the parser first checks the raw record text and only then parses fields.
+- Progress is printed to stderr by default every 5 seconds. Disable it with `--progress-interval 0`.

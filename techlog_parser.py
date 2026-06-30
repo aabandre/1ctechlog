@@ -13,12 +13,13 @@ import argparse
 import fnmatch
 import re
 import sys
+import time
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Deque, Iterator, Optional, Pattern, Sequence
+from typing import Callable, Deque, Iterator, Optional, Pattern, Sequence
 
 HEADER_RE = re.compile(
     r"^(?P<time>(?:\d{8}\s+)?\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)-(?P<duration>\d+),(?P<event>[A-Z0-9_]+)(?:,|$)"
@@ -32,7 +33,7 @@ METRIC_PATTERNS = {
 }
 SQL_KEYS = ("Sql", "SQL", "sql", "SqlText", "SQLText", "Text")
 PLAN_KEYS = ("planSQLText", "PlanSQLText", "Plan", "plan", "QueryPlan")
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 
 @dataclass(frozen=True)
@@ -67,18 +68,27 @@ def _unquote(value: str) -> str:
     return value
 
 
-def iter_records(path: Path, encoding: str = "utf-8", errors: str = "replace") -> Iterator[Record]:
+def iter_records(
+    path: Path,
+    encoding: str = "utf-8",
+    errors: str = "replace",
+    progress: Optional[Callable[[Path, int], None]] = None,
+) -> Iterator[Record]:
     """Yield records from *path* while holding only the current record in memory."""
     with path.open("rb") as fh:
         current_offset: Optional[int] = None
         current_header: Optional[re.Match[str]] = None
         chunks: list[str] = []
+        line_count = 0
 
         while True:
             offset = fh.tell()
             raw = fh.readline()
             if not raw:
                 break
+            line_count += 1
+            if progress is not None and line_count % 10000 == 0:
+                progress(path, fh.tell())
             line = raw.decode(encoding, errors=errors)
             header = HEADER_RE.match(line)
             if header:
@@ -90,6 +100,8 @@ def iter_records(path: Path, encoding: str = "utf-8", errors: str = "replace") -
             elif current_header is not None:
                 chunks.append(line)
 
+        if progress is not None:
+            progress(path, fh.tell())
         if current_header is not None and current_offset is not None:
             yield Record(path, current_offset, current_header.group("time"), current_header.group("event"), "".join(chunks))
 
@@ -122,6 +134,12 @@ def contains_field(fields: dict[str, str], keys: Sequence[str], needle: Optional
 def matches(record: Record, filters: Filters) -> bool:
     if filters.event_types and record.event.upper() not in filters.event_types:
         return False
+    if filters.object_name and filters.object_name not in record.text:
+        return False
+    if filters.text and filters.text not in record.text:
+        return False
+    if filters.regex and not filters.regex.search(record.text):
+        return False
     fields = get_fields(record.text)
     checks = [
         (("SessionID", "SessionId", "sessionID"), filters.session_id),
@@ -137,10 +155,6 @@ def matches(record: Record, filters: Filters) -> bool:
         context = first_field(fields, ("Context", "context"))
         if filters.object_name not in context:
             return False
-    if filters.text and filters.text not in record.text:
-        return False
-    if filters.regex and not filters.regex.search(record.text):
-        return False
     return True
 
 
@@ -211,6 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save-dir", type=Path, help="save each matching raw record to this directory")
     parser.add_argument("--output", type=Path, help="write the formatted search results to this file instead of stdout")
     parser.add_argument("--encoding", default="utf-8", help="input encoding (default: utf-8)")
+    parser.add_argument("--progress-interval", type=float, default=5.0, help="seconds between progress messages to stderr; use 0 to disable (default: 5)")
     return parser
 
 
@@ -219,25 +234,62 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     events = frozenset(e.strip().upper() for item in (args.event or []) for e in item.split(",") if e.strip())
     filters = Filters(args.session_id, args.usr, args.context, args.os_thread, args.connect_id, args.dbpid, events, args.text, re.compile(args.regex, re.DOTALL) if args.regex else None, args.object_name)
     buffer: Deque[Record] | None = deque(maxlen=args.last) if args.last else None
-    count = 0
+    matched_count = 0
+    record_count = 0
+    file_count = 0
+    bytes_done = 0
+    start_time = time.monotonic()
+    last_progress_time = start_time
+
+    def log_progress(path: Path, position: int, *, force: bool = False) -> None:
+        nonlocal last_progress_time
+        if args.progress_interval <= 0:
+            return
+        now = time.monotonic()
+        if not force and now - last_progress_time < args.progress_interval:
+            return
+        elapsed = max(now - start_time, 0.001)
+        mib_done = (bytes_done + position) / (1024 * 1024)
+        speed = mib_done / elapsed
+        print(
+            f"[progress] files={file_count} records={record_count} matched={matched_count} "
+            f"read={mib_done:.1f} MiB speed={speed:.1f} MiB/s current={path} offset={position}",
+            file=sys.stderr,
+            flush=True,
+        )
+        last_progress_time = now
+
     if args.output and args.output.parent != Path("."):
         args.output.parent.mkdir(parents=True, exist_ok=True)
     output_context = args.output.open("w", encoding="utf-8") if args.output else nullcontext(sys.stdout)
     with output_context as output:
         for path in iter_files(args.paths, args.glob, args.since):
-            for record in iter_records(path, args.encoding):
+            file_count += 1
+            log_progress(path, 0, force=(file_count == 1))
+            last_position = 0
+
+            def update_position(current_path: Path, position: int) -> None:
+                nonlocal last_position
+                last_position = position
+                log_progress(current_path, position)
+
+            for record in iter_records(path, args.encoding, progress=update_position):
+                record_count += 1
                 if not matches(record, filters):
                     continue
-                count += 1
+                matched_count += 1
                 if args.save_dir:
-                    save_record(record, args.save_dir, count)
+                    save_record(record, args.save_dir, matched_count)
                 if buffer is not None:
                     buffer.append(record)
                 else:
                     print(record_summary(record), end="\n\n", file=output)
+            bytes_done += last_position or path.stat().st_size
         if buffer is not None:
             for record in buffer:
                 print(record_summary(record), end="\n\n", file=output)
+    if args.progress_interval > 0:
+        log_progress(Path("<done>"), 0, force=True)
     return 0
 
 
