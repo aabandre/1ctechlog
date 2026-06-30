@@ -1,0 +1,16 @@
+{
+  "paths": ["."],
+  "glob": "*.log",
+  "since": "3600m",
+  "event": ["DBPOSTGRS", "SDBL", "TLOCK", "EXCP"],
+  "object": "ЖурналДокументов.КадровыеДокументы",
+  "last": 20,
+  "tail_reverse": true,
+  "from_time": "00:00",
+  "to_time": "23:59:59",
+  "output": "results.txt",
+  "save_dir": "found",
+  "progress_interval": 5,
+  "full_text": true,
+  "format": "text"
+}
