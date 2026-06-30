@@ -32,6 +32,7 @@ METRIC_PATTERNS = {
 }
 SQL_KEYS = ("Sql", "SQL", "sql", "SqlText", "SQLText", "Text")
 PLAN_KEYS = ("planSQLText", "PlanSQLText", "Plan", "plan", "QueryPlan")
+VERSION = "1.2.0"
 
 
 @dataclass(frozen=True)
@@ -192,6 +193,7 @@ def parse_duration(value: Optional[str]) -> Optional[timedelta]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Stream-search 1C technological journal files.")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     parser.add_argument("paths", nargs="+", type=Path, help="log files or directories")
     parser.add_argument("--glob", default="*.log", help="file name mask for directory scans (default: *.log)")
     parser.add_argument("--since", type=parse_duration, help="only files modified in the last N minutes/hours, e.g. 30m or 2h")

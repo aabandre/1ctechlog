@@ -38,3 +38,12 @@ Useful options:
 --glob MASK            file mask when scanning directories; default is *.log
 --encoding ENCODING    input encoding; default is utf-8
 ```
+
+## Verify the script version
+
+If `--object` or `--output` is reported as an unrecognized argument, you are running an older copy of the script. Copy the current `techlog_parser.py` over that file (for example, over `Untitled-4.py`) and verify that help shows both options:
+
+```bash
+python3 techlog_parser.py --help | grep -E -- '--object|--output'
+python3 techlog_parser.py --version
+```
