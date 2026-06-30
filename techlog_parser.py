@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import re
+import sys
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -21,7 +23,7 @@ from typing import Deque, Iterator, Optional, Pattern, Sequence
 HEADER_RE = re.compile(
     r"^(?P<time>(?:\d{8}\s+)?\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)-(?P<duration>\d+),(?P<event>[A-Z0-9_]+)(?:,|$)"
 )
-KEY_VALUE_RE = re.compile(r"(?:^|,)(?P<key>[A-Za-z][A-Za-z0-9_]*)=(?P<value>\"(?:[^\"]|\"\")*\"|[^,\r\n]*)", re.MULTILINE)
+KEY_VALUE_RE = re.compile(r"(?:^|,)(?P<key>[A-Za-z][A-Za-z0-9_:]*)=(?P<value>\"(?:[^\"]|\"\")*\"|'(?:[^']|'')*'|[^,\r\n]*)", re.MULTILINE)
 METRIC_PATTERNS = {
     "Planning Time": re.compile(r"Planning\s+Time\s*[:=]\s*([^,\"\r\n]+)", re.IGNORECASE),
     "Execution Time": re.compile(r"Execution\s+Time\s*[:=]\s*([^,\"\r\n]+)", re.IGNORECASE),
@@ -43,6 +45,7 @@ class Filters:
     event_types: frozenset[str] = frozenset()
     text: Optional[str] = None
     regex: Optional[Pattern[str]] = None
+    object_name: Optional[str] = None
 
 
 @dataclass
@@ -58,6 +61,8 @@ def _unquote(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] == '"':
         return value[1:-1].replace('""', '"')
+    if len(value) >= 2 and value[0] == value[-1] == "'":
+        return value[1:-1].replace("''", "'")
     return value
 
 
@@ -122,11 +127,15 @@ def matches(record: Record, filters: Filters) -> bool:
         (("Usr", "User", "user"), filters.usr),
         (("Context", "context"), filters.context),
         (("OSThread", "OsThread", "osThread"), filters.os_thread),
-        (("ConnectID", "ConnectId", "connectID"), filters.connect_id),
+        (("ConnectID", "ConnectId", "connectID", "t:connectID"), filters.connect_id),
         (("DBPID", "DbPid", "dbpid"), filters.dbpid),
     ]
     if any(not contains_field(fields, keys, value) for keys, value in checks):
         return False
+    if filters.object_name:
+        context = first_field(fields, ("Context", "context"))
+        if filters.object_name not in context:
+            return False
     if filters.text and filters.text not in record.text:
         return False
     if filters.regex and not filters.regex.search(record.text):
@@ -150,6 +159,8 @@ def record_summary(record: Record) -> str:
         f"offset={record.offset}",
         f"time={record.time}",
         f"event={record.event}",
+        f"Rows={fields.get('Rows') or '-'}",
+        f"Context={first_field(fields, ('Context', 'context')) or '-'}",
         f"Planning Time={metric(record.text, 'Planning Time') or '-'}",
         f"Execution Time={metric(record.text, 'Execution Time') or '-'}",
         f"Buffers={metric(record.text, 'Buffers') or '-'}",
@@ -188,13 +199,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--session-id")
     parser.add_argument("--usr")
     parser.add_argument("--context")
+    parser.add_argument("--object", dest="object_name", help="substring to search inside Context, e.g. ЖурналДокументов.КадровыеДокументы")
     parser.add_argument("--os-thread")
     parser.add_argument("--connect-id")
     parser.add_argument("--dbpid")
     parser.add_argument("--text", help="substring to search in the complete record")
     parser.add_argument("--regex", help="regular expression to search in the complete record")
     parser.add_argument("--last", type=int, help="print only the last N matching records")
-    parser.add_argument("--save-dir", type=Path, help="save each matching record to this directory")
+    parser.add_argument("--save-dir", type=Path, help="save each matching raw record to this directory")
+    parser.add_argument("--output", type=Path, help="write the formatted search results to this file instead of stdout")
     parser.add_argument("--encoding", default="utf-8", help="input encoding (default: utf-8)")
     return parser
 
@@ -202,23 +215,27 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     events = frozenset(e.strip().upper() for item in (args.event or []) for e in item.split(",") if e.strip())
-    filters = Filters(args.session_id, args.usr, args.context, args.os_thread, args.connect_id, args.dbpid, events, args.text, re.compile(args.regex, re.DOTALL) if args.regex else None)
+    filters = Filters(args.session_id, args.usr, args.context, args.os_thread, args.connect_id, args.dbpid, events, args.text, re.compile(args.regex, re.DOTALL) if args.regex else None, args.object_name)
     buffer: Deque[Record] | None = deque(maxlen=args.last) if args.last else None
     count = 0
-    for path in iter_files(args.paths, args.glob, args.since):
-        for record in iter_records(path, args.encoding):
-            if not matches(record, filters):
-                continue
-            count += 1
-            if args.save_dir:
-                save_record(record, args.save_dir, count)
-            if buffer is not None:
-                buffer.append(record)
-            else:
-                print(record_summary(record), end="\n\n")
-    if buffer is not None:
-        for record in buffer:
-            print(record_summary(record), end="\n\n")
+    if args.output and args.output.parent != Path("."):
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+    output_context = args.output.open("w", encoding="utf-8") if args.output else nullcontext(sys.stdout)
+    with output_context as output:
+        for path in iter_files(args.paths, args.glob, args.since):
+            for record in iter_records(path, args.encoding):
+                if not matches(record, filters):
+                    continue
+                count += 1
+                if args.save_dir:
+                    save_record(record, args.save_dir, count)
+                if buffer is not None:
+                    buffer.append(record)
+                else:
+                    print(record_summary(record), end="\n\n", file=output)
+        if buffer is not None:
+            for record in buffer:
+                print(record_summary(record), end="\n\n", file=output)
     return 0
 
 
